@@ -1,0 +1,14 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "my-claude-plugins",
+  "description": "Personal fork of select Claude Code plugins with nanoclaw-shared improvements.",
+  "owner": { "name": "Tom Alison" },
+  "plugins": [
+    {
+      "name": "telegram",
+      "description": "Telegram messaging bridge (forked — uses nanoclaw's shared telegram-core for consistent behavior).",
+      "category": "productivity",
+      "source": "./plugins/telegram"
+    }
+  ]
+}
