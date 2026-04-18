@@ -1,4 +1,4 @@
-// SOURCE: nanoclaw@36f92ecd0eaa4a372d96fd22591eb83538f0d222 src/telegram-core/chunk.ts (synced 2026-04-18)
+// SOURCE: nanoclaw@364c58fda9dc738e9ce12d3f69e6830bb6ef4cdd src/telegram-core/chunk.ts (synced 2026-04-18)
 export type ChunkMode = 'length' | 'newline';
 
 /**

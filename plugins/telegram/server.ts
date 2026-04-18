@@ -22,10 +22,12 @@ import {
   isMentioned,
   safeName,
   sendText,
+  startTyping,
+  stopTyping,
 } from './core/index.js'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 
@@ -33,6 +35,17 @@ const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', '
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
+const DEBUG_LOG = join(STATE_DIR, 'fork-debug.log')
+
+// Post-mortem line per shutdown trigger — stderr isn't captured after MCP
+// disconnect, so a persistent file is the only way to see which handler fired.
+// Cheap: one line on startup, one on shutdown. Delete the file anytime.
+const startedAt = Date.now()
+function debugLog(msg: string): void {
+  try {
+    appendFileSync(DEBUG_LOG, `${new Date().toISOString()} pid=${process.pid} ${msg}\n`)
+  } catch {}
+}
 
 // Load ~/.claude/channels/telegram/.env into process.env. Real env wins.
 // Plugin-spawned servers don't get an env block — this is where the token lives.
@@ -73,6 +86,8 @@ try {
   }
 } catch {}
 writeFileSync(PID_FILE, String(process.pid))
+
+debugLog(`startup: ppid=${process.ppid}`)
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -465,6 +480,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     switch (req.params.name) {
       case 'reply': {
         const chat_id = args.chat_id as string
+        // Clear the typing indicator started in handleInbound. The shared-core
+        // primitive is idempotent, so a reply unrelated to a prior inbound is safe.
+        stopTyping(chat_id)
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         const files = (args.files as string[] | undefined) ?? []
@@ -586,10 +604,12 @@ await mcp.connect(new StdioServerTransport())
 // the bot keeps polling forever as a zombie, holding the token and blocking
 // the next session with 409 Conflict.
 let shuttingDown = false
-function shutdown(): void {
+function shutdown(trigger: string): void {
   if (shuttingDown) return
   shuttingDown = true
-  process.stderr.write('telegram channel: shutting down\n')
+  const uptime = Math.round((Date.now() - startedAt) / 1000)
+  debugLog(`shutdown trigger=${trigger} uptime=${uptime}s`)
+  process.stderr.write(`telegram channel: shutting down (${trigger}, uptime=${uptime}s)\n`)
   try {
     if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
   } catch {}
@@ -598,11 +618,11 @@ function shutdown(): void {
   setTimeout(() => process.exit(0), 2000)
   void Promise.resolve(bot.stop()).finally(() => process.exit(0))
 }
-process.stdin.on('end', shutdown)
-process.stdin.on('close', shutdown)
-process.on('SIGTERM', shutdown)
-process.on('SIGINT', shutdown)
-process.on('SIGHUP', shutdown)
+process.stdin.on('end', () => shutdown('stdin:end'))
+process.stdin.on('close', () => shutdown('stdin:close'))
+process.on('SIGTERM', () => shutdown('SIGTERM'))
+process.on('SIGINT', () => shutdown('SIGINT'))
+process.on('SIGHUP', () => shutdown('SIGHUP'))
 
 // Orphan watchdog: stdin events above don't reliably fire when the parent
 // chain (`bun run` wrapper → shell → us) is severed by a crash. Poll for
@@ -613,7 +633,7 @@ setInterval(() => {
     (process.platform !== 'win32' && process.ppid !== bootPpid) ||
     process.stdin.destroyed ||
     process.stdin.readableEnded
-  if (orphaned) shutdown()
+  if (orphaned) shutdown('watchdog:orphan')
 }, 5000).unref()
 
 // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
@@ -882,8 +902,11 @@ async function handleInbound(
     return
   }
 
-  // Typing indicator — signals "processing" until we reply (or ~5s elapses).
-  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  // Typing indicator — persists until the reply tool fires stopTyping(chat_id)
+  // or the 3-minute safety cap in startTyping auto-stops. Telegram's native
+  // typing expires in ~5s; startTyping re-emits every 4s to keep it visible
+  // across the full processing window (tool calls, LLM latency, etc).
+  startTyping(bot.api, chat_id)
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   // Telegram only accepts a fixed emoji whitelist — if the user configures
