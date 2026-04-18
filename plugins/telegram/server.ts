@@ -35,11 +35,13 @@ const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', '
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
-const DEBUG_LOG = join(STATE_DIR, 'fork-debug.log')
+const LOG_DIR = join(STATE_DIR, 'logs')
+const DEBUG_LOG = join(LOG_DIR, 'fork-debug.log')
 
 // Post-mortem line per shutdown trigger — stderr isn't captured after MCP
 // disconnect, so a persistent file is the only way to see which handler fired.
 // Cheap: one line on startup, one on shutdown. Delete the file anytime.
+// Kept under logs/ to avoid mingling with security state (.env, access.json).
 const startedAt = Date.now()
 function debugLog(msg: string): void {
   try {
@@ -72,22 +74,17 @@ if (!TOKEN) {
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 
-// Telegram allows exactly one getUpdates consumer per token. If a previous
-// session crashed (SIGKILL, terminal closed) its server.ts grandchild can
-// survive as an orphan and hold the slot forever, so every new session sees
-// 409 Conflict. Kill any stale holder before we start polling.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-try {
-  const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-  if (stale > 1 && stale !== process.pid) {
-    process.kill(stale, 0)
-    process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-    process.kill(stale, 'SIGTERM')
-  }
-} catch {}
-writeFileSync(PID_FILE, String(process.pid))
+mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 })
 
 debugLog(`startup: ppid=${process.ppid}`)
+
+// Telegram allows exactly one getUpdates consumer per token. The stale-PID
+// kill + PID_FILE claim is deferred until past mcp.connect() + shutdown
+// handlers — see the block below bot.start's registration. Running this
+// code at module top would let a phantom subprocess (Claude Code spawn
+// that gets stdin:end within milliseconds) SIGTERM the currently-running
+// real poller before the phantom itself dies.
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -480,8 +477,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     switch (req.params.name) {
       case 'reply': {
         const chat_id = args.chat_id as string
-        // Clear the typing indicator started in handleInbound. The shared-core
-        // primitive is idempotent, so a reply unrelated to a prior inbound is safe.
+        // Idempotent — safe even with no prior startTyping for this chat.
         stopTyping(chat_id)
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
@@ -623,6 +619,23 @@ process.stdin.on('close', () => shutdown('stdin:close'))
 process.on('SIGTERM', () => shutdown('SIGTERM'))
 process.on('SIGINT', () => shutdown('SIGINT'))
 process.on('SIGHUP', () => shutdown('SIGHUP'))
+
+// Claim the bot.pid slot *after* mcp.connect() + shutdown handlers above.
+// If we're a phantom (Claude Code spawned us but stdin closes within ms), the
+// shutdown handlers above fire first and set shuttingDown — we skip the
+// stale-PID SIGTERM and never write our own PID, leaving the real poller
+// alone. Only stable subprocesses reach this block.
+if (!shuttingDown) {
+  try {
+    const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+    if (stale > 1 && stale !== process.pid) {
+      process.kill(stale, 0)
+      process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
+      process.kill(stale, 'SIGTERM')
+    }
+  } catch {}
+  writeFileSync(PID_FILE, String(process.pid))
+}
 
 // Orphan watchdog: stdin events above don't reliably fire when the parent
 // chain (`bun run` wrapper → shell → us) is severed by a crash. Poll for

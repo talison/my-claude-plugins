@@ -1,4 +1,4 @@
-// SOURCE: nanoclaw@364c58fda9dc738e9ce12d3f69e6830bb6ef4cdd src/telegram-core/typing.ts (synced 2026-04-18)
+// SOURCE: nanoclaw@bdec19b931b64ef9449ec53b00b89d5c36c1ad6c src/telegram-core/typing.ts (synced 2026-04-18)
 import type { Api } from 'grammy';
 
 export interface WithTypingOpts {
@@ -6,9 +6,10 @@ export interface WithTypingOpts {
   message_thread_id?: number;
   /**
    * Safety cap — if stopTyping is never called, auto-stop after this many ms.
-   * Prevents leaks when a caller crashes or forgets to stop. Default 180_000
-   * (3 min). Pass 0 to disable the cap (withTyping does this internally since
-   * its try/finally guarantees cleanup).
+   * Prevents leaks when a caller crashes or forgets to stop. Default 90_000
+   * (90s). A reply hung past 90s is genuinely broken; continuing to emit
+   * "typing" beyond that is lying to the user. Pass 0 to disable the cap
+   * (withTyping does this internally since try/finally guarantees cleanup).
    */
   maxMs?: number;
 }
@@ -42,7 +43,7 @@ export function startTyping(
   stopTyping(chat_id);
 
   const intervalMs = opts.intervalMs ?? 4000;
-  const maxMs = opts.maxMs ?? 180_000;
+  const maxMs = opts.maxMs ?? 90_000;
   const extra =
     opts.message_thread_id != null
       ? { message_thread_id: opts.message_thread_id }
@@ -57,14 +58,18 @@ export function startTyping(
 
   fire();
   const interval = setInterval(fire, intervalMs);
-  if (typeof (interval as unknown as { unref?: () => void }).unref === 'function') {
+  if (
+    typeof (interval as unknown as { unref?: () => void }).unref === 'function'
+  ) {
     (interval as unknown as { unref: () => void }).unref();
   }
 
   let safety: ReturnType<typeof setTimeout> | null = null;
   if (maxMs > 0) {
     safety = setTimeout(() => stopTyping(chat_id), maxMs);
-    if (typeof (safety as unknown as { unref?: () => void }).unref === 'function') {
+    if (
+      typeof (safety as unknown as { unref?: () => void }).unref === 'function'
+    ) {
       (safety as unknown as { unref: () => void }).unref();
     }
   }

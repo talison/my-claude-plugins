@@ -1,4 +1,4 @@
-// SOURCE: nanoclaw@364c58fda9dc738e9ce12d3f69e6830bb6ef4cdd src/telegram-core/mention.ts (synced 2026-04-18)
+// SOURCE: nanoclaw@bdec19b931b64ef9449ec53b00b89d5c36c1ad6c src/telegram-core/mention.ts (synced 2026-04-18)
 import type { Context } from 'grammy';
 
 /**
