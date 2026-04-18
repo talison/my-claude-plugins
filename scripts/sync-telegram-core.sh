@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Sync nanoclaw's src/telegram-core/ into plugins/telegram/core/ at a given commit SHA.
+# Sync nanoclaw's src/telegram-core/ into plugins/telegram/core/ at a given ref.
 # Usage: ./scripts/sync-telegram-core.sh [<nanoclaw-ref>]
 # Default ref: main on talison/nanoclaw (override via NANOCLAW_REMOTE env var).
+#
+# GitHub disables the git-upload-archive service, so `git archive --remote` fails.
+# We use a shallow clone into a tmpdir instead.
 set -euo pipefail
 
 NANOCLAW_REMOTE="${NANOCLAW_REMOTE:-https://github.com/talison/nanoclaw.git}"
@@ -13,29 +16,28 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 echo "Syncing $NANOCLAW_REMOTE @ $NANOCLAW_REF → plugins/telegram/core/"
 
-# Use git archive to fetch just the telegram-core subtree (no full clone)
-git archive --remote="$NANOCLAW_REMOTE" "$NANOCLAW_REF" src/telegram-core 2>/dev/null \
-  | tar -x -C "$TMPDIR"
+# Try shallow clone of the named ref (works for branches and tags).
+if ! git clone --depth=1 --branch "$NANOCLAW_REF" --quiet "$NANOCLAW_REMOTE" "$TMPDIR/repo" 2>/dev/null; then
+  # Fallback: clone default branch, then fetch the SHA explicitly.
+  git clone --depth=1 --quiet "$NANOCLAW_REMOTE" "$TMPDIR/repo"
+  (cd "$TMPDIR/repo" && git fetch --depth=1 origin "$NANOCLAW_REF" && git checkout --quiet FETCH_HEAD)
+fi
 
-if [[ ! -d "$TMPDIR/src/telegram-core" ]]; then
+SRC="$TMPDIR/repo/src/telegram-core"
+if [[ ! -d "$SRC" ]]; then
   echo "ERROR: src/telegram-core/ not found at $NANOCLAW_REF — nothing to sync" >&2
   exit 1
 fi
 
-# Resolve the actual SHA for the SOURCE header (git-archive doesn't tell us directly)
-SHA="$(git ls-remote "$NANOCLAW_REMOTE" "$NANOCLAW_REF" | awk 'NR==1{print $1}')"
-if [[ -z "$SHA" ]]; then
-  # Fallback: if ref is already a full SHA, use it as-is
-  SHA="$NANOCLAW_REF"
-fi
+SHA="$(git -C "$TMPDIR/repo" rev-parse HEAD)"
 DATE="$(date -u +%Y-%m-%d)"
 
-# Wipe existing core/ and repopulate from scratch
+# Wipe existing core/ and repopulate from scratch.
 rm -rf "$TARGET"
 mkdir -p "$TARGET"
 
-# Copy each .ts file, prepending a SOURCE header; skip test files
-for f in "$TMPDIR/src/telegram-core"/*.ts; do
+# Copy each .ts file, prepending a SOURCE header; skip test files.
+for f in "$SRC"/*.ts; do
   name="$(basename "$f")"
   case "$name" in
     *.test.ts) continue ;;
@@ -46,7 +48,7 @@ for f in "$TMPDIR/src/telegram-core"/*.ts; do
   } > "$TARGET/$name"
 done
 
-# Metadata file for auditing and upstream-SHA comparison
+# Metadata file for auditing and drift detection.
 cat > "$TARGET/.sync-source" <<EOF
 remote=$NANOCLAW_REMOTE
 ref=$NANOCLAW_REF
