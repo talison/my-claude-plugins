@@ -17,6 +17,12 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
+import {
+  chunk,
+  isMentioned,
+  safeName,
+  sendText,
+} from './core/index.js'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
@@ -275,39 +281,13 @@ function gate(ctx: Context): GateResult {
     if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
       return { action: 'drop' }
     }
-    if (requireMention && !isMentioned(ctx, access.mentionPatterns)) {
+    if (requireMention && !isMentioned(ctx, access.mentionPatterns, botUsername)) {
       return { action: 'drop' }
     }
     return { action: 'deliver', access }
   }
 
   return { action: 'drop' }
-}
-
-function isMentioned(ctx: Context, extraPatterns?: string[]): boolean {
-  const entities = ctx.message?.entities ?? ctx.message?.caption_entities ?? []
-  const text = ctx.message?.text ?? ctx.message?.caption ?? ''
-  for (const e of entities) {
-    if (e.type === 'mention') {
-      const mentioned = text.slice(e.offset, e.offset + e.length)
-      if (mentioned.toLowerCase() === `@${botUsername}`.toLowerCase()) return true
-    }
-    if (e.type === 'text_mention' && e.user?.is_bot && e.user.username === botUsername) {
-      return true
-    }
-  }
-
-  // Reply to one of our messages counts as an implicit mention.
-  if (ctx.message?.reply_to_message?.from?.username === botUsername) return true
-
-  for (const pat of extraPatterns ?? []) {
-    try {
-      if (new RegExp(pat, 'i').test(text)) return true
-    } catch {
-      // Invalid user-supplied regex — skip it.
-    }
-  }
-  return false
 }
 
 // The /telegram:access skill drops a file at approved/<senderId> when it pairs
@@ -337,30 +317,6 @@ function checkApprovals(): void {
 }
 
 if (!STATIC) setInterval(checkApprovals, 5000).unref()
-
-// Telegram caps messages at 4096 chars. Split long replies, preferring
-// paragraph boundaries when chunkMode is 'newline'.
-
-function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[] {
-  if (text.length <= limit) return [text]
-  const out: string[] = []
-  let rest = text
-  while (rest.length > limit) {
-    let cut = limit
-    if (mode === 'newline') {
-      // Prefer the last double-newline (paragraph), then single newline,
-      // then space. Fall back to hard cut.
-      const para = rest.lastIndexOf('\n\n', limit)
-      const line = rest.lastIndexOf('\n', limit)
-      const space = rest.lastIndexOf(' ', limit)
-      cut = para > limit / 2 ? para : line > limit / 2 ? line : space > 0 ? space : limit
-    }
-    out.push(rest.slice(0, cut))
-    rest = rest.slice(cut).replace(/^\n+/, '')
-  }
-  if (rest) out.push(rest)
-  return out
-}
 
 // .jpg/.jpeg/.png/.gif/.webp go as photos (Telegram compresses + shows inline);
 // everything else goes as documents (raw file, no compression).
@@ -451,8 +407,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           format: {
             type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+            enum: ['text', 'claude'],
+            description: "Rendering mode. 'claude' (default) translates Claude-native Markdown (**bold**, ## headings, etc.) to Telegram MarkdownV2 with parse-error fallback to plain. 'text' sends raw with no parse_mode.",
           },
         },
         required: ['chat_id', 'text'],
@@ -512,8 +468,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         const files = (args.files as string[] | undefined) ?? []
-        const format = (args.format as string | undefined) ?? 'text'
-        const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
+        const rawFormat = (args.format as string | undefined) ?? 'claude'
+        // Legacy callers may still pass 'markdownv2' (pre-escaped). We no longer
+        // support that path — downgrade to 'text' so the literal chars ship as-is.
+        const format: 'text' | 'claude' =
+          rawFormat === 'text' || rawFormat === 'markdownv2' ? 'text' : 'claude'
 
         assertAllowedChat(chat_id)
 
@@ -529,26 +488,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
         const sentIds: number[] = []
 
         try {
-          for (let i = 0; i < chunks.length; i++) {
-            const shouldReplyTo =
-              reply_to != null &&
-              replyMode !== 'off' &&
-              (replyMode === 'all' || i === 0)
-            const sent = await bot.api.sendMessage(chat_id, chunks[i], {
-              ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
-              ...(parseMode ? { parse_mode: parseMode } : {}),
-            })
-            sentIds.push(sent.message_id)
-          }
+          const ids = await sendText(bot.api, chat_id, text, {
+            format,
+            reply_to,
+            replyToMode: replyMode,
+            chunkMode: mode,
+            chunkLimit: limit,
+          })
+          sentIds.push(...ids)
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
-          throw new Error(
-            `reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`,
-          )
+          throw new Error(`reply failed after ${sentIds.length} chunk(s) sent: ${msg}`)
         }
 
         // Files go as separate messages (Telegram doesn't mix text+file in one
@@ -882,13 +835,6 @@ type AttachmentMeta = {
   size?: number
   mime?: string
   name?: string
-}
-
-// Filenames and titles are uploader-controlled. They land inside the <channel>
-// notification — delimiter chars would let the uploader break out of the tag
-// or forge a second meta entry.
-function safeName(s: string | undefined): string | undefined {
-  return s?.replace(/[<>\[\]\r\n;]/g, '_')
 }
 
 async function handleInbound(
