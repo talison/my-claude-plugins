@@ -1,4 +1,4 @@
-// SOURCE: nanoclaw@e953bd1226c4707bad3ce6477af46a5fbe0e16b0 src/telegram-core/markdown-translate.ts (synced 2026-04-18)
+// SOURCE: nanoclaw@36f92ecd0eaa4a372d96fd22591eb83538f0d222 src/telegram-core/markdown-translate.ts (synced 2026-04-18)
 /**
  * Telegram MarkdownV2 reserves these characters: _ * [ ] ( ) ~ ` > # + - = | { } . !
  * Every literal occurrence must be backslash-escaped.
@@ -71,21 +71,53 @@ export function claudeToTelegramV2(text: string): string {
     return makePh(`*${escInner}*`);
   });
 
-  // 2b. Strikethrough — before plain escape (~~ contains ~).
+  // 2b. Strikethrough (double tilde) — before single-tilde strike (~~ contains ~).
   text = text.replace(/~~([^~\n]+?)~~/g, (_m, inner) => {
     const escInner = inner.replace(V2_RESERVED, '\\$&');
     return makePh(`~${escInner}~`);
   });
 
-  // 2c. Bold — before italic (** contains *).
-  text = text.replace(/\*\*([^*\n]+?)\*\*/g, (_m, inner) => {
-    const escInner = inner.replace(V2_RESERVED, '\\$&');
-    return makePh(`*${escInner}*`);
+  // 2c. Single-tilde strikethrough. Word-boundary lookarounds avoid matching
+  //     `~tilde_in~word`, and the (?=\S)/(?<=\S) guards avoid `~ spaced ~`.
+  text = text.replace(
+    /(?<!\w)~(?=\S)([^~\n]+?)(?<=\S)~(?!\w)/g,
+    (_m, inner) => {
+      const escInner = inner.replace(V2_RESERVED, '\\$&');
+      return makePh(`~${escInner}~`);
+    },
+  );
+
+  // 2d. Bold (double asterisk) — accepts single `*` chars inside so a bold
+  //     phrase containing `*italic*` still matches the outer bold. Inner italics
+  //     are transformed recursively before reserved-char escaping.
+  const ITALIC_STAR_RE = /(?<!\w)\*(?=\S)([^*\n]+?)(?<=\S)\*(?!\w)/g;
+  const ITALIC_UNDER_RE = /(?<!\w)_([^_\n]+?)_(?!\w)/g;
+  text = text.replace(/\*\*([^\n]+?)\*\*/g, (_m, inner) => {
+    // Transform nested italics first so they survive the outer escape.
+    let transformed = inner
+      .replace(ITALIC_STAR_RE, (_m2, it) => {
+        const esc = it.replace(V2_RESERVED, '\\$&');
+        return makePh(`_${esc}_`);
+      })
+      .replace(ITALIC_UNDER_RE, (_m2, it) => {
+        const esc = it.replace(V2_RESERVED, '\\$&');
+        return makePh(`_${esc}_`);
+      });
+    const escOuter = transformed.replace(V2_RESERVED, '\\$&');
+    return makePh(`*${escOuter}*`);
   });
 
-  // 2d. Italic — _text_ with word-boundary lookarounds so snake_case_identifiers
-  //     don't get matched accidentally.
-  text = text.replace(/(?<!\w)_([^_\n]+?)_(?!\w)/g, (_m, inner) => {
+  // 2e. Italic via single asterisk (outside bold) — CommonMark's emphasis.
+  //     Guards: non-word preceding/following to avoid `snake_case*foo*`;
+  //     (?=\S)/(?<=\S) to avoid `* item` bullets or `5 * 3 * 2`.
+  text = text.replace(ITALIC_STAR_RE, (_m, inner) => {
+    const escInner = inner.replace(V2_RESERVED, '\\$&');
+    return makePh(`_${escInner}_`);
+  });
+
+  // 2f. Italic via underscore — _text_ with word-boundary lookarounds so
+  //     snake_case_identifiers don't get matched accidentally.
+  text = text.replace(ITALIC_UNDER_RE, (_m, inner) => {
     const escInner = inner.replace(V2_RESERVED, '\\$&');
     return makePh(`_${escInner}_`);
   });

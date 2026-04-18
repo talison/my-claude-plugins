@@ -1,4 +1,4 @@
-// SOURCE: nanoclaw@e953bd1226c4707bad3ce6477af46a5fbe0e16b0 src/telegram-core/index.ts (synced 2026-04-18)
+// SOURCE: nanoclaw@36f92ecd0eaa4a372d96fd22591eb83538f0d222 src/telegram-core/index.ts (synced 2026-04-18)
 export { chunk, type ChunkMode } from './chunk.js';
 export { escapeMarkdownV2, isParseEntitiesError } from './markdown.js';
 export { claudeToTelegramV2 } from './markdown-translate.js';
