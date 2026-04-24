@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Sync nanoclaw's src/telegram-core/ into plugins/telegram/core/ at a given ref.
-# Usage: ./scripts/sync-telegram-core.sh [<nanoclaw-ref>]
-# Default ref: main on talison/nanoclaw (override via NANOCLAW_REMOTE env var).
+# Sync harness's src/telegram-core/ into plugins/telegram/core/ at a given ref.
+# Usage: ./scripts/sync-telegram-core.sh [<harness-ref>]
+# Default ref: main on talison/harness (override via HARNESS_REMOTE env var).
+# (NANOCLAW_REMOTE is still honored for backwards compatibility but deprecated.)
 #
 # GitHub disables the git-upload-archive service, so `git archive --remote` fails.
 # We use a shallow clone into a tmpdir instead.
 set -euo pipefail
 
-NANOCLAW_REMOTE="${NANOCLAW_REMOTE:-https://github.com/talison/nanoclaw.git}"
+HARNESS_REMOTE="${HARNESS_REMOTE:-${NANOCLAW_REMOTE:-https://github.com/talison/harness.git}}"
+NANOCLAW_REMOTE="$HARNESS_REMOTE"
 NANOCLAW_REF="${1:-main}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="$REPO_ROOT/plugins/telegram/core"
@@ -43,7 +45,7 @@ for f in "$SRC"/*.ts; do
     *.test.ts) continue ;;
   esac
   {
-    echo "// SOURCE: nanoclaw@${SHA} src/telegram-core/${name} (synced ${DATE})"
+    echo "// SOURCE: harness@${SHA} src/telegram-core/${name} (synced ${DATE})"
     cat "$f"
   } > "$TARGET/$name"
 done

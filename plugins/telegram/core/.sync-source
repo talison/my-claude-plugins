@@ -1,4 +1,4 @@
-remote=https://github.com/talison/nanoclaw.git
+remote=https://github.com/talison/harness.git
 ref=main
-sha=bdec19b931b64ef9449ec53b00b89d5c36c1ad6c
-synced_at=2026-04-18
+sha=9b67e8012e531063cdfabebe57f62b661ba154aa
+synced_at=2026-04-24

@@ -1,4 +1,4 @@
-// SOURCE: nanoclaw@bdec19b931b64ef9449ec53b00b89d5c36c1ad6c src/telegram-core/index.ts (synced 2026-04-18)
+// SOURCE: harness@9b67e8012e531063cdfabebe57f62b661ba154aa src/telegram-core/index.ts (synced 2026-04-24)
 export { chunk, type ChunkMode } from './chunk.js';
 export { escapeMarkdownV2, isParseEntitiesError } from './markdown.js';
 export { claudeToTelegramV2 } from './markdown-translate.js';
@@ -13,8 +13,10 @@ export {
 export {
   sendText,
   editText,
+  setSendDiagnosticLogger,
   type MarkdownFormat,
   type SendTextOpts,
 } from './send.js';
 export { sendStream, type SendStreamOpts } from './stream.js';
 export { downloadAttachment } from './download.js';
+export { Chunker, type ChunkerOpts } from './chunker.js';

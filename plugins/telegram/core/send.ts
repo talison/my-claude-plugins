@@ -1,8 +1,19 @@
-// SOURCE: nanoclaw@bdec19b931b64ef9449ec53b00b89d5c36c1ad6c src/telegram-core/send.ts (synced 2026-04-18)
+// SOURCE: harness@9b67e8012e531063cdfabebe57f62b661ba154aa src/telegram-core/send.ts (synced 2026-04-24)
 import type { Api } from 'grammy';
 import { chunk, type ChunkMode } from './chunk.js';
 import { claudeToTelegramV2 } from './markdown-translate.js';
 import { isParseEntitiesError } from './markdown.js';
+
+// Optional diagnostic logger — set by the host at boot. When present, we log
+// parse-entities fallback events with enough detail to debug broken markdown.
+// Keeping this in telegram-core (not depending on host logger) preserves the
+// core's no-host-imports rule.
+let diagLog: ((msg: string, ctx: Record<string, unknown>) => void) | undefined;
+export function setSendDiagnosticLogger(
+  fn: (msg: string, ctx: Record<string, unknown>) => void,
+): void {
+  diagLog = fn;
+}
 
 export type MarkdownFormat = 'text' | 'claude';
 
@@ -35,6 +46,11 @@ async function sendOneChunk(
       return res.message_id;
     } catch (err) {
       if (isParseEntitiesError(err) && parseMode) {
+        diagLog?.('Telegram parse_mode fallback triggered', {
+          error: (err as Error).message,
+          preparedPreview: preparedText.slice(0, 300),
+          originalPreview: originalText.slice(0, 300),
+        });
         const res: any = await api.sendMessage(chat_id, originalText, {
           ...extra,
         });

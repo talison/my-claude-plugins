@@ -1,4 +1,4 @@
-// SOURCE: nanoclaw@bdec19b931b64ef9449ec53b00b89d5c36c1ad6c src/telegram-core/markdown-translate.ts (synced 2026-04-18)
+// SOURCE: harness@9b67e8012e531063cdfabebe57f62b661ba154aa src/telegram-core/markdown-translate.ts (synced 2026-04-24)
 /**
  * Telegram MarkdownV2 reserves these characters: _ * [ ] ( ) ~ ` > # + - = | { } . !
  * Every literal occurrence must be backslash-escaped.
@@ -92,14 +92,14 @@ export function claudeToTelegramV2(text: string): string {
   //     are transformed recursively before reserved-char escaping.
   const ITALIC_STAR_RE = /(?<!\w)\*(?=\S)([^*\n]+?)(?<=\S)\*(?!\w)/g;
   const ITALIC_UNDER_RE = /(?<!\w)_([^_\n]+?)_(?!\w)/g;
-  text = text.replace(/\*\*([^\n]+?)\*\*/g, (_m, inner) => {
+  text = text.replace(/\*\*([^\n]+?)\*\*/g, (_m, inner: string) => {
     // Transform nested italics first so they survive the outer escape.
     let transformed = inner
-      .replace(ITALIC_STAR_RE, (_m2, it) => {
+      .replace(ITALIC_STAR_RE, (_m2: string, it: string) => {
         const esc = it.replace(V2_RESERVED, '\\$&');
         return makePh(`_${esc}_`);
       })
-      .replace(ITALIC_UNDER_RE, (_m2, it) => {
+      .replace(ITALIC_UNDER_RE, (_m2: string, it: string) => {
         const esc = it.replace(V2_RESERVED, '\\$&');
         return makePh(`_${esc}_`);
       });
