@@ -22,6 +22,7 @@ import {
   isMentioned,
   safeName,
   sendText,
+  setSendDiagnosticLogger,
   startTyping,
   stopTyping,
 } from './core/index.js'
@@ -40,14 +41,19 @@ const DEBUG_LOG = join(LOG_DIR, 'fork-debug.log')
 
 // Post-mortem line per shutdown trigger — stderr isn't captured after MCP
 // disconnect, so a persistent file is the only way to see which handler fired.
-// Cheap: one line on startup, one on shutdown. Delete the file anytime.
+// Also captures send retries, send failures, polling errors, and handler
+// errors via setSendDiagnosticLogger + bot.catch + the polling retry loop —
+// silent-failure modes that previously left zero forensic trace.
 // Kept under logs/ to avoid mingling with security state (.env, access.json).
 const startedAt = Date.now()
-function debugLog(msg: string): void {
+function debugLog(msg: string, ctx?: Record<string, unknown>): void {
   try {
-    appendFileSync(DEBUG_LOG, `${new Date().toISOString()} pid=${process.pid} ${msg}\n`)
+    const tail = ctx ? ` ${JSON.stringify(ctx)}` : ''
+    appendFileSync(DEBUG_LOG, `${new Date().toISOString()} pid=${process.pid} ${msg}${tail}\n`)
   } catch {}
 }
+
+setSendDiagnosticLogger((msg, ctx) => debugLog(msg, ctx))
 
 // Load ~/.claude/channels/telegram/.env into process.env. Real env wins.
 // Plugin-spawned servers don't get an env block — this is where the token lives.
@@ -964,7 +970,9 @@ async function handleInbound(
 // Without this, any throw in a message handler stops polling permanently
 // (grammy's default error handler calls bot.stop() and rethrows).
 bot.catch(err => {
-  process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
+  const detail = `${err.error}`
+  process.stderr.write(`telegram channel: handler error (polling continues): ${detail}\n`)
+  debugLog('handler error (polling continues)', { error: detail })
 })
 
 // Retry polling with backoff on any error. Previously only 409 was retried —
@@ -980,6 +988,7 @@ void (async () => {
           attempt = 0
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
+          debugLog('polling started', { username: info.username })
           void bot.api.setMyCommands(
             [
               { command: 'start', description: 'Welcome and setup guide' },
@@ -1001,6 +1010,7 @@ void (async () => {
           `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
           `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
         )
+        debugLog('polling exit: 409 persists', { attempts: attempt })
         return
       }
       const delay = Math.min(1000 * attempt, 15000)
@@ -1008,6 +1018,7 @@ void (async () => {
         ? `409 Conflict${attempt === 1 ? ' — another instance is polling (zombie session, or a second Claude Code running?)' : ''}`
         : `polling error: ${err}`
       process.stderr.write(`telegram channel: ${detail}, retrying in ${delay / 1000}s\n`)
+      debugLog('polling error, retrying', { detail, attempt, delay_ms: delay })
       await new Promise(r => setTimeout(r, delay))
     }
   }

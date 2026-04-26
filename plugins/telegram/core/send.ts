@@ -1,13 +1,12 @@
-// SOURCE: harness@9b67e8012e531063cdfabebe57f62b661ba154aa src/telegram-core/send.ts (synced 2026-04-24)
 import type { Api } from 'grammy';
 import { chunk, type ChunkMode } from './chunk.js';
 import { claudeToTelegramV2 } from './markdown-translate.js';
 import { isParseEntitiesError } from './markdown.js';
 
 // Optional diagnostic logger — set by the host at boot. When present, we log
-// parse-entities fallback events with enough detail to debug broken markdown.
-// Keeping this in telegram-core (not depending on host logger) preserves the
-// core's no-host-imports rule.
+// parse-entities fallback events, 429 retries, and final non-recoverable send
+// failures. Keeping this in telegram-core (not depending on host logger)
+// preserves the core's no-host-imports rule.
 let diagLog: ((msg: string, ctx: Record<string, unknown>) => void) | undefined;
 export function setSendDiagnosticLogger(
   fn: (msg: string, ctx: Record<string, unknown>) => void,
@@ -59,9 +58,22 @@ async function sendOneChunk(
       const retryAfter = (err as any)?.parameters?.retry_after;
       if (retryAfter != null && attempt < MAX_429_RETRIES) {
         attempt++;
+        diagLog?.('Telegram 429 retry', {
+          attempt,
+          retry_after: retryAfter,
+          chat_id,
+        });
         await new Promise((r) => setTimeout(r, retryAfter * 1000));
         continue;
       }
+      diagLog?.('Telegram send failed', {
+        error: (err as Error).message,
+        error_code: (err as any)?.error_code,
+        description: (err as any)?.description,
+        parameters: (err as any)?.parameters,
+        chat_id,
+        attempts: attempt + 1,
+      });
       throw err;
     }
   }
