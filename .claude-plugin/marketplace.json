@@ -1,14 +1,20 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "my-claude-plugins",
-  "description": "Personal fork of select Claude Code plugins with nanoclaw-shared improvements.",
+  "name": "cortex-agent-plugins",
+  "description": "Personal Claude Code plugins for Cortex (telegram fork, agent-to-agent comms bridge).",
   "owner": { "name": "Tom Alison" },
   "plugins": [
     {
       "name": "telegram",
-      "description": "Telegram messaging bridge (forked — uses nanoclaw's shared telegram-core for consistent behavior).",
+      "description": "Telegram messaging bridge (forked — uses harness's shared telegram-core for consistent behavior).",
       "category": "productivity",
       "source": "./plugins/telegram"
+    },
+    {
+      "name": "comms-bridge",
+      "description": "Agent-to-agent comms channel for Cortex. Long-polls the local comms-bridge HTTP service (127.0.0.1:9475) and exposes a send tool for outbound messages to Max.",
+      "category": "productivity",
+      "source": "./plugins/comms-bridge"
     }
   ]
 }
