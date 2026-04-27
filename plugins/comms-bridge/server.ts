@@ -324,6 +324,14 @@ void (async () => {
           // the message we failed on (since cursorValue is still old).
           break
         }
+        // Best-effort ack so the bridge can distinguish delivered-and-ack'd
+        // from delivered-but-stuck. Failure here doesn't hold up the cursor —
+        // a missed ack just leaves the row in the same state pre-ack-wiring.
+        try {
+          await bridge.ack(msg.uuid)
+        } catch (err) {
+          debugLog('ack failed', { uuid: msg.uuid, error: String(err) })
+        }
         // Per-message cursor advance — if we crash mid-batch we resume after
         // the last successfully delivered message.
         cursorValue = msg.id
