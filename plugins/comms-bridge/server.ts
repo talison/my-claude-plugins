@@ -1,0 +1,359 @@
+#!/usr/bin/env bun
+/**
+ * comms-bridge channel for Claude Code (Cortex side).
+ *
+ * Long-polls the comms-bridge HTTP service (Phase 1, ai.cortex.comms-bridge,
+ * 127.0.0.1:9475) for messages addressed to "cortex". Each inbound message is
+ * delivered to the Claude Code session via an MCP `notifications/claude/channel`
+ * notification — Claude Code wraps it as
+ *   <channel source="plugin:comms-bridge:agent" from="..." uuid="..." kind="..." ...>BODY</channel>
+ * which Cortex's reply-routing already understands.
+ *
+ * Outbound: exposes a single MCP tool, `send`, fully-qualified as
+ *   mcp__plugin_comms_bridge_agent__send
+ * which POSTs to the bridge service.
+ *
+ * Architecture mirrors the telegram fork's server.ts (sibling plugin), minus
+ * Telegram-specific concerns (pairing, reactions, attachments). Where the
+ * telegram fork talks to Telegram's Bot API, this talks to the local HTTP
+ * bridge — same shape, simpler surface.
+ */
+
+import { Server } from '@modelcontextprotocol/sdk/server/index.js'
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from '@modelcontextprotocol/sdk/types.js'
+import { appendFileSync, mkdirSync } from 'fs'
+import { homedir } from 'os'
+import { join } from 'path'
+import { randomUUID } from 'crypto'
+
+import { Backoff } from './lib/backoff.ts'
+import { BridgeClient, BridgeError, type InboxMessage } from './lib/bridge-client.ts'
+import { Cursor } from './lib/cursor.ts'
+import { renderPayload } from './lib/payload.ts'
+
+const AGENT = 'cortex'
+const ALLOWED_PEERS = new Set(['max'])
+const ALLOWED_KINDS = new Set(['request', 'response', 'notify'])
+const POLL_TIMEOUT_SECONDS = 25
+
+const STATE_DIR =
+  process.env.COMMS_BRIDGE_STATE_DIR ??
+  join(homedir(), '.claude', 'channels', 'comms-bridge')
+const LOG_DIR = join(STATE_DIR, 'logs')
+const DEBUG_LOG = join(LOG_DIR, 'fork-debug.log')
+
+const CURSOR_PATH =
+  process.env.COMMS_BRIDGE_CURSOR_PATH ??
+  join(homedir(), '.cortex', 'data', `comms-bridge.${AGENT}.cursor`)
+
+const BRIDGE_BASE_URL =
+  process.env.COMMS_BRIDGE_URL ?? 'http://127.0.0.1:9475'
+
+// Persistent diagnostic log — stderr isn't captured after MCP disconnect, and
+// silent failures (long-poll loop dying) leave zero forensic trace otherwise.
+// Mirrors the telegram fork's fork-debug.log convention.
+mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 })
+
+const startedAt = Date.now()
+function debugLog(msg: string, ctx?: Record<string, unknown>): void {
+  try {
+    const tail = ctx ? ` ${JSON.stringify(ctx)}` : ''
+    appendFileSync(
+      DEBUG_LOG,
+      `${new Date().toISOString()} pid=${process.pid} ${msg}${tail}\n`,
+    )
+  } catch {}
+}
+
+debugLog(`startup: ppid=${process.ppid} bridge=${BRIDGE_BASE_URL}`)
+
+// Last-resort safety net — without these the process dies silently on any
+// unhandled promise rejection. Same pattern as telegram fork.
+process.on('unhandledRejection', err => {
+  debugLog('unhandledRejection', { error: String(err) })
+  process.stderr.write(`comms-bridge channel: unhandled rejection: ${err}\n`)
+})
+process.on('uncaughtException', err => {
+  debugLog('uncaughtException', { error: String(err) })
+  process.stderr.write(`comms-bridge channel: uncaught exception: ${err}\n`)
+})
+
+const cursor = new Cursor(CURSOR_PATH)
+const bridge = new BridgeClient({ baseUrl: BRIDGE_BASE_URL })
+
+const mcp = new Server(
+  { name: 'comms-bridge', version: '0.1.0' },
+  {
+    capabilities: {
+      tools: {},
+      experimental: {
+        'claude/channel': {},
+      },
+    },
+    instructions: [
+      'This is the agent-to-agent comms bridge — for messages between Cortex and Max, NOT for replying to Tom (those still go via the Telegram plugin).',
+      '',
+      'Inbound messages arrive as <channel source="plugin:comms-bridge:agent" from="<agent>" uuid="<uuid>" kind="<request|response|notify>" id="<n>" ts="<iso>"> with an optional reply_to_uuid attribute when threading a response. The channel body is the payload — a string, or a pretty-printed JSON object/array. The other agent and you agree on payload shape via prompt; the bridge itself is opaque.',
+      '',
+      'To reply or initiate, call mcp__plugin_comms_bridge_agent__send with to_agent (typically "max"), text, and an optional kind (default "notify"). Pass reply_to_uuid set to the inbound uuid when replying, so the other side can thread. For structured payloads, omit text and pass payload as a JSON object instead. The bridge enforces a 64KB payload cap.',
+      '',
+      'Kinds: "request" expects a response back; "response" closes a request thread (always with reply_to_uuid); "notify" is fire-and-forget for state changes the other agent might care about.',
+    ].join('\n'),
+  },
+)
+
+// ---- MCP: ListTools / CallTool ---------------------------------------------
+
+mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: 'send',
+      description:
+        'Send a message to another agent (currently only "max"). For Tom-facing replies, use the Telegram plugin instead — this channel is agent-to-agent only.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          to_agent: {
+            type: 'string',
+            enum: ['max'],
+            description: 'Recipient agent. Currently only "max" is reachable from Cortex.',
+          },
+          text: {
+            type: 'string',
+            description:
+              'Plain-text message body. Sent as the payload as-is (string-typed). Mutually exclusive with `payload`.',
+          },
+          payload: {
+            type: 'object',
+            description:
+              'Structured JSON payload. Use when you need fields beyond plain text. Mutually exclusive with `text`. 64KB cap enforced by the bridge.',
+            additionalProperties: true,
+          },
+          kind: {
+            type: 'string',
+            enum: ['request', 'response', 'notify'],
+            description:
+              'Message kind. "request" expects a response, "response" closes a thread (must set reply_to_uuid), "notify" is fire-and-forget. Default: notify.',
+          },
+          reply_to_uuid: {
+            type: 'string',
+            description:
+              'When replying to a previous inbound message, set to that message\'s uuid so the other side can thread.',
+          },
+        },
+        required: ['to_agent'],
+      },
+    },
+  ],
+}))
+
+mcp.setRequestHandler(CallToolRequestSchema, async req => {
+  const args = (req.params.arguments ?? {}) as Record<string, unknown>
+  try {
+    switch (req.params.name) {
+      case 'send': {
+        const to_agent = String(args.to_agent ?? '')
+        if (!ALLOWED_PEERS.has(to_agent)) {
+          throw new Error(
+            `unknown to_agent ${JSON.stringify(to_agent)}: allowed=${[...ALLOWED_PEERS].join(',')}`,
+          )
+        }
+
+        const text = args.text
+        const payload = args.payload
+        if (text != null && payload != null) {
+          throw new Error('pass either `text` or `payload`, not both')
+        }
+        if (text == null && payload == null) {
+          throw new Error('one of `text` or `payload` is required')
+        }
+        const body: unknown =
+          text != null ? String(text) : (payload as Record<string, unknown>)
+
+        const kindRaw = (args.kind as string | undefined) ?? 'notify'
+        if (!ALLOWED_KINDS.has(kindRaw)) {
+          throw new Error(
+            `unknown kind ${kindRaw}: allowed=${[...ALLOWED_KINDS].join(',')}`,
+          )
+        }
+        const kind = kindRaw as 'request' | 'response' | 'notify'
+
+        const reply_to_uuid =
+          args.reply_to_uuid != null ? String(args.reply_to_uuid) : undefined
+
+        const uuid = randomUUID()
+        const result = await bridge.send({
+          uuid,
+          from_agent: AGENT,
+          to_agent,
+          kind,
+          payload: body,
+          reply_to_uuid,
+        })
+
+        debugLog('send ok', {
+          uuid,
+          to_agent,
+          kind,
+          id: result.id,
+          duplicate: result.duplicate,
+        })
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                sent: true,
+                uuid,
+                id: result.id,
+                duplicate: result.duplicate,
+              }),
+            },
+          ],
+        }
+      }
+      default:
+        return {
+          content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }],
+          isError: true,
+        }
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    const detail =
+      err instanceof BridgeError && err.body ? `${msg} (body: ${err.body})` : msg
+    debugLog(`${req.params.name} failed`, { error: detail })
+    return {
+      content: [{ type: 'text', text: `${req.params.name} failed: ${detail}` }],
+      isError: true,
+    }
+  }
+})
+
+await mcp.connect(new StdioServerTransport())
+
+// ---- shutdown handlers ------------------------------------------------------
+
+let shuttingDown = false
+const shutdownAbort = new AbortController()
+
+function shutdown(trigger: string): void {
+  if (shuttingDown) return
+  shuttingDown = true
+  const uptime = Math.round((Date.now() - startedAt) / 1000)
+  debugLog(`shutdown trigger=${trigger} uptime=${uptime}s`)
+  process.stderr.write(
+    `comms-bridge channel: shutting down (${trigger}, uptime=${uptime}s)\n`,
+  )
+  shutdownAbort.abort()
+  // Force-exit after 2s — same as telegram fork; the long-poll fetch may take
+  // up to its full timeout to abort cleanly.
+  setTimeout(() => process.exit(0), 2000)
+}
+
+process.stdin.on('end', () => shutdown('stdin:end'))
+process.stdin.on('close', () => shutdown('stdin:close'))
+process.on('SIGTERM', () => shutdown('SIGTERM'))
+process.on('SIGINT', () => shutdown('SIGINT'))
+process.on('SIGHUP', () => shutdown('SIGHUP'))
+
+// Orphan watchdog — stdin events don't reliably fire if the parent chain is
+// severed by a crash. Same pattern as telegram fork.
+const bootPpid = process.ppid
+setInterval(() => {
+  const orphaned =
+    (process.platform !== 'win32' && process.ppid !== bootPpid) ||
+    process.stdin.destroyed ||
+    process.stdin.readableEnded
+  if (orphaned) shutdown('watchdog:orphan')
+}, 5000).unref()
+
+// ---- inbox poll loop --------------------------------------------------------
+
+async function deliverMessage(msg: InboxMessage): Promise<void> {
+  const meta: Record<string, string> = {
+    from: msg.from_agent,
+    uuid: msg.uuid,
+    kind: msg.kind,
+    id: String(msg.id),
+    ts: msg.created_at,
+  }
+  if (msg.reply_to_uuid) {
+    meta.reply_to_uuid = msg.reply_to_uuid
+  }
+  const content = renderPayload(msg.payload)
+  await mcp.notification({
+    method: 'notifications/claude/channel',
+    params: { content, meta },
+  })
+}
+
+void (async () => {
+  const backoff = new Backoff()
+  let cursorValue = cursor.read()
+  debugLog('poll loop starting', { cursor: cursorValue })
+
+  while (!shuttingDown) {
+    try {
+      const res = await bridge.inbox(
+        AGENT,
+        cursorValue,
+        POLL_TIMEOUT_SECONDS,
+        shutdownAbort.signal,
+      )
+      backoff.reset()
+
+      for (const msg of res.messages) {
+        try {
+          await deliverMessage(msg)
+        } catch (err) {
+          // Delivering to Claude Code failed — log and continue. Don't advance
+          // the cursor for *this* message: leave it for the next poll cycle so
+          // we don't lose it.
+          debugLog('deliver failed', {
+            uuid: msg.uuid,
+            error: String(err),
+          })
+          // Stop processing this batch; next loop iteration will pick up from
+          // the message we failed on (since cursorValue is still old).
+          break
+        }
+        // Per-message cursor advance — if we crash mid-batch we resume after
+        // the last successfully delivered message.
+        cursorValue = msg.id
+        cursor.write(cursorValue)
+      }
+
+      // Fast-path: when the bridge returned next_cursor without delivering
+      // anything (timeout case), advance cursor anyway so we don't re-poll the
+      // same window forever if cursor write was lossy.
+      if (res.messages.length === 0 && res.next_cursor > cursorValue) {
+        cursorValue = res.next_cursor
+        cursor.write(cursorValue)
+      }
+    } catch (err) {
+      if (shuttingDown) return
+      // AbortError from the shutdown signal is expected; bail out cleanly.
+      const name = err instanceof Error ? err.name : ''
+      if (name === 'AbortError') return
+
+      const detail = err instanceof Error ? err.message : String(err)
+      const delay = backoff.next()
+      debugLog('inbox error, retrying', {
+        detail,
+        attempt: backoff.attempts,
+        delay_ms: delay,
+      })
+      process.stderr.write(
+        `comms-bridge channel: inbox error: ${detail}; retrying in ${(delay / 1000).toFixed(1)}s\n`,
+      )
+      await new Promise(r => setTimeout(r, delay))
+    }
+  }
+})()
