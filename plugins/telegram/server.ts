@@ -955,8 +955,8 @@ async function handleInbound(
         ...(ctx.message?.reply_to_message?.message_id != null
           ? { reply_to_message_id: String(ctx.message.reply_to_message.message_id) }
           : {}),
-        ...(ctx.message?.reply_to_message?.text != null
-          ? { reply_to_message_text: ctx.message.reply_to_message.text }
+        ...((ctx.message?.reply_to_message?.text ?? ctx.message?.reply_to_message?.caption) != null
+          ? { reply_to_message_text: ctx.message.reply_to_message.text ?? ctx.message.reply_to_message.caption }
           : {}),
         ...(imagePath ? { image_path: imagePath } : {}),
         ...(attachment ? {
